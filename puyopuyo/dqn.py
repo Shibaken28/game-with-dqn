@@ -27,6 +27,60 @@ os.mkdir("./"+id)
 os.mkdir("./"+id+"/img")
 os.mkdir("./"+id+"/csv")
 
+from collections import defaultdict
+
+ACTION_SPACE = 6
+STATE_SPACE = 78
+
+class UnionFind():
+    def __init__(self, n):
+        self.n = n
+        self.parents = [-1] * n
+
+    def find(self, x):
+        if self.parents[x] < 0:
+            return x
+        else:
+            self.parents[x] = self.find(self.parents[x])
+            return self.parents[x]
+
+    def union(self, x, y):
+        x = self.find(x)
+        y = self.find(y)
+
+        if x == y:
+            return
+
+        if self.parents[x] > self.parents[y]:
+            x, y = y, x
+
+        self.parents[x] += self.parents[y]
+        self.parents[y] = x
+
+    def size(self, x):
+        return -self.parents[self.find(x)]
+
+    def same(self, x, y):
+        return self.find(x) == self.find(y)
+
+    def members(self, x):
+        root = self.find(x)
+        return [i for i in range(self.n) if self.find(i) == root]
+
+    def roots(self):
+        return [i for i, x in enumerate(self.parents) if x < 0]
+
+    def group_count(self):
+        return len(self.roots())
+
+    def all_group_members(self):
+        group_members = defaultdict(list)
+        for member in range(self.n):
+            group_members[self.find(member)].append(member)
+        return group_members
+
+    def __str__(self):
+        return '\n'.join(f'{r}: {m}' for r, m in self.all_group_members().items())
 
 class Game:
     """
@@ -46,17 +100,96 @@ class Game:
         self.puyo_list = []
         for i in range(50):
             self.puyo_list.append((random.randint(1, 4), random.randint(1, 4)))
+        self.turn = 0
+        return self.states(), None
 
     def states(self):
+        # 現在の盤面の状態
+        # 次の3ターンで降るぷよの色
+        # tensorに変換
+        # 盤面を1次元に変換
+        state = np.reshape(self.board, (1, -1))
+        # 次の3ターンで降るぷよの色を1次元に変換
+        for i in range(3):
+            # 降るぷよの色を1次元に変換
+            puyo = np.array(self.puyo_list[self.turn+i])
+            puyo = np.reshape(puyo, (1, -1))
+            # 1次元に結合
+            state = np.concatenate([state, puyo], axis=1)
         
-        return torch.tensor([self.enemy_pos_list[self.time][0]/self.width, self.enemy_pos_list[self.time][1]/self.height, self.enemy_pos_list[r][0]/self.width, self.enemy_pos_list[r][1]/self.height, self.player_pos[0]/self.width, self.player_pos[1]/self.height], dtype=torch.float32)
+        # dtypeをfloat32に変換
+        state = torch.tensor(state, dtype=torch.float32)
+        return state
 
-
+    
     def step(self, action):
-        
+        # action: i番目の列にぷよを落とす ... i=0~5
+        # reward: 連鎖数
+        # done: 50ターン経過
+        reward = 0
+        done = False
+        win = False
+
+        puyo = self.puyo_list[self.turn]
+        self.turn += 1
+        # action列目にぷよを落とす
+        isDropped = self.drop_puyo(action, puyo)
+        if isDropped[0] == -1:
+            # 落とせなかったら負け
+            done = True
+            reward = -1
+        else:
+            _ , chain = self.check_connect()
+            reward = chain
+            if self.turn >= 50:
+                done = True
+                win = True
 
         return self.states(), reward, done, {}, win
 
+    def drop_puyo(self, col, puyo):
+        # col列目にぷよを落とす
+        # 落とせない場合は-1を返す
+        # 落とせた場合は落とした座標を返す
+        for row in range(self.height):
+            if self.board[row][col] == 0:
+                self.board[row][col] = puyo[0]
+                self.board[row-1][col] = puyo[1]
+                return (row, col)
+        return (-1, -1)
+    
+    def check_connect(self):
+        # ぷよを消す
+        # 消えたぷよの数と連鎖数を返す
+        # 連結しているぷよを探索する
+        disapear = 0
+        chain = 0
+        while True:
+            uf = UnionFind(self.width*self.height)
+            directions = [(1, 0), (0, 1), (-1, 0), (0, -1)]
+            for row in range(self.height):
+                for col in range(self.width):
+                    if self.board[row][col] == 0:
+                        continue
+                    for d in directions:
+                        nr = row + d[0]
+                        nc = col + d[1]
+                        if nr < 0 or nr >= self.height or nc < 0 or nc >= self.width:
+                            continue
+                        if self.board[row][col] == self.board[nr][nc]:
+                            uf.union(row*self.width+col, nr*self.width+nc)
+            # 連結しているぷよの数が4以上なら消す
+            g = uf.all_group_members()
+            for group in g.values():
+                if len(group) >= 4:
+                    disapear += len(group)
+                    for p in group:
+                        self.board[p//self.width][p%self.width] = 0
+            if disapear == 0:
+                break
+            chain += 1
+
+        return disapear, chain
 
 
 
@@ -88,7 +221,7 @@ class ReplayBuffer:
 class QNet(nn.Module):
     def __init__(self, action_size):
         super().__init__()
-        self.l1 = nn.Linear(6, 128)
+        self.l1 = nn.Linear(STATE_SPACE, 128)
         self.l2 = nn.Linear(128, 128)
         self.l3 = nn.Linear(128, action_size)
 
@@ -101,12 +234,12 @@ class QNet(nn.Module):
 
 class DQNAgent:
     def __init__(self):
-        self.gamma = 0.95
+        self.gamma = 0.8
         self.lr = 0.0005
         self.epsilon = 0.05
         self.buffer_size = 10000
         self.batch_size = 32
-        self.action_size = 3
+        self.action_size = ACTION_SPACE
 
         self.replay_buffer = ReplayBuffer(self.buffer_size, self.batch_size)
         self.qnet = QNet(self.action_size)
@@ -117,6 +250,7 @@ class DQNAgent:
         if np.random.rand() < self.epsilon:
             return np.random.choice(self.action_size)
         else:
+            print(state)
             state_tensor = torch.tensor(state).unsqueeze(0)  # バッチ次元を追加
             qs = self.qnet(state_tensor)
             return qs.argmax().item()
